@@ -111,6 +111,17 @@ impl RecurringContract {
         authorization.next_chargeable_at = now
             .checked_add(authorization.period_seconds)
             .ok_or(Error::InvalidTimeRange)?;
+        // The period is consumed and persisted here, *before* `transfer_from`
+        // moves any funds. This ordering is intentional: Soroban aborts the
+        // whole invocation and rolls back every state change when a host call
+        // (the token transfer) traps, so a failed transfer cannot leave the
+        // period consumed -- the `periods_charged` bump and the advanced
+        // `next_chargeable_at` are reverted together with the failed call.
+        // That rollback, not the save-first ordering itself, is what makes
+        // this safe; it also means a reentrant token sees the already-advanced
+        // `next_chargeable_at` and cannot charge the same period twice.
+        // Compare `escrow::pay`, where persisting state before the token call
+        // serves reentrancy protection specifically.
         storage::save(&env, &authorization);
 
         token::TokenClient::new(&env, &authorization.token).transfer_from(

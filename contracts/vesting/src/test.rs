@@ -1111,6 +1111,54 @@ fn revoke_emits_the_revoked_event() {
     assert_eq!(last, &expected.to_xdr(&f.env, &f.client.address));
 }
 
+/// Regression test for the `still_claimable: math::sub(vested, claimed)?`
+/// dead-calculation concern: claiming *exactly* the vested amount and then
+/// revoking in the same ledger leaves `claimed == vested`, so the event's
+/// subtraction is exactly zero. `revoke` must succeed rather than abort with
+/// `Underflow`, and there is nothing left claimable afterwards.
+#[test]
+fn revoke_succeeds_immediately_after_claiming_all_vested_tokens() {
+    let f = Fixture::new(true);
+    // Partial vest: at START + 300 with CLIFF = 100 and DURATION = 1_000,
+    // vested = TOTAL * 300 / 1_000 = 300_000.
+    f.at(START + 300);
+
+    let claimed = f.client.claim();
+    let vested_now = f.client.vested_amount(&(START + 300));
+    assert_eq!(claimed, vested_now, "claim must take the full vested amount");
+    assert_eq!(f.client.get().claimed, vested_now);
+
+    // Revoke at the very same timestamp: claimed == vested, so the event's
+    // `still_claimable` is exactly zero and `revoke` must not underflow.
+    let returned = f.client.revoke();
+    assert_eq!(
+        returned,
+        TOTAL - vested_now,
+        "only the unvested remainder is returned"
+    );
+
+    let events = f
+        .env
+        .events()
+        .all()
+        .filter_by_contract(&f.client.address);
+    let last = events.events().last().expect("no events emitted");
+    let expected = Revoked {
+        grantor: f.grantor.clone(),
+        returned_to_grantor: TOTAL - vested_now,
+        still_claimable: 0,
+        revoked_at: START + 300,
+    };
+    assert_eq!(last, &expected.to_xdr(&f.env, &f.client.address));
+
+    // Nothing is left to claim, and conservation still holds.
+    assert_eq!(
+        f.client.try_claim(),
+        Err(Ok(Error::VestingNothingToClaim))
+    );
+    f.assert_conserved();
+}
+
 // ------------------------------------------------------- conservation
 
 #[test]
@@ -1342,6 +1390,93 @@ mod vested_amount_properties {
                 .expect("vested_amount(after revocation) must not error");
 
             prop_assert_eq!(at_revocation, after);
+        }
+    }
+}
+
+mod conservation_properties {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    /// One step of a random call sequence against a live grant. Invalid calls
+    /// (e.g. claiming before the cliff) are included on purpose: a rejected
+    /// call must roll back and preserve conservation.
+    #[derive(Clone, Copy, Debug)]
+    enum Op {
+        Advance(u64),
+        Claim,
+        Revoke,
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// The vesting conservation invariant
+        /// `claimed + returned + remaining == total` holds after every call of
+        /// an arbitrary sequence of claim / revoke calls, and the contract's
+        /// real token balance always equals `remaining`.
+        #[test]
+        fn conservation_holds_after_any_call_sequence(
+            total in 1i128..=1_000_000_000,
+            duration in 1u64..=1_000,
+            cliff_frac in 0u64..=100,
+            ops in proptest::collection::vec(prop_oneof![
+                (1u64..=500).prop_map(Op::Advance),
+                Just(Op::Claim),
+                Just(Op::Revoke),
+            ], 1..=24),
+        ) {
+            let start = 1_000_000u64;
+            let cliff = duration.saturating_mul(cliff_frac) / 100;
+            let te = TestEnv::at(start);
+            let (token, grantor) = te.make_token(1_000_000_000_000_000);
+            let token_address = token.address.clone();
+            let beneficiary = te.make_address();
+            let env = te.env().clone();
+
+            let client = VestingContractClient::new(&env, &env.register(VestingContract, ()));
+            client.create(
+                &grantor,
+                &beneficiary,
+                &token_address,
+                &total,
+                &start,
+                &cliff,
+                &duration,
+                &true,
+            );
+
+            for op in ops {
+                match op {
+                    Op::Advance(delta) => {
+                        te.advance_to(te.timestamp().saturating_add(delta));
+                    }
+                    Op::Claim => {
+                        let _ = client.try_claim();
+                    }
+                    Op::Revoke => {
+                        let _ = client.try_revoke();
+                    }
+                }
+
+                let g = client.get();
+                let remaining = client.remaining();
+                prop_assert!(
+                    g.claimed >= 0 && g.returned >= 0 && remaining >= 0,
+                    "negative component after {:?}: {:?}", op, g
+                );
+                prop_assert_eq!(
+                    g.claimed + g.returned + remaining,
+                    g.total,
+                    "conservation violated after {:?}: {:?}", op, g
+                );
+                prop_assert_eq!(
+                    token.balance(&client.address),
+                    remaining,
+                    "held balance diverged after {:?}: {:?}", op, g
+                );
+            }
         }
     }
 }

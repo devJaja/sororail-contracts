@@ -170,6 +170,13 @@ impl VestingContract {
         events::Revoked {
             grantor: grant.grantor.clone(),
             returned_to_grantor: unvested,
+            // `claimed` can never exceed `vested` here: `claim` adds exactly
+            // the positive `claimable_at = vested - claimed`, so it never
+            // overshoots the vested amount, and `vested_amount` is monotonic
+            // in time, so the `vested` computed at revocation is at least the
+            // `vested` that capped every earlier claim. The subtraction is
+            // therefore total -- `Underflow` is unreachable, which
+            // `revoke_succeeds_after_claiming_every_vested_token` pins down.
             still_claimable: math::sub(vested, grant.claimed)?,
             revoked_at: now,
         }
